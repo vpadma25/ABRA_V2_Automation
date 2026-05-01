@@ -1,0 +1,23 @@
+{
+  "name": "abra",
+  "version": "1.0.0",
+  "description": "",
+  "main": "login.js",
+  "scripts": {
+    "test": "playwright test",
+    "login": "node login_clean.js",
+    "sample-report": "node generate_sample_report.js",
+    "test-email": "node test-email.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "nodemailer": "^8.0.5"
+  }
+}

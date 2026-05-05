@@ -4,353 +4,472 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-// Login credentials (loaded from .env)
+// ---- Configuration ----
 const credentials = {
   email: process.env.TEST_USER_EMAIL,
-  password: process.env.TEST_USER_PASSWORD
+  password: process.env.TEST_USER_PASSWORD,
 };
 
-// Group name created earlier (use today's date)
-const groupName = 'Test Company ' + new Date().toISOString().slice(0, 10);
+// Group name pattern that addnewgroup.js creates
+const TODAY = new Date().toISOString().slice(0, 10);
+const GROUP_NAME = process.env.GROUP_NAME || `QA-Test_${TODAY}`;
+
+// Unique plan name per run (so the script can be run repeatedly the same day)
+const RUN_ID = new Date().toISOString().slice(11, 19).replace(/:/g, '');
+const PLAN_NAME = process.env.PLAN_NAME || `QA-Plan_${TODAY}_${RUN_ID}`;
 
 const screenshotsDir = path.join(__dirname, 'screenshots');
+if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir);
 
-async function addPlanToGroup() {
+// Plan type to select in the "Plan Type" dropdown
+const PLAN_TYPE = process.env.PLAN_TYPE || 'Dental';
+
+// Valid test data, keyed by likely form field names (matched against `name`, `formcontrolname`, or `id`)
+const planData = {
+  // Plan Basics
+  name: PLAN_NAME,
+  planName: PLAN_NAME,
+  planType: PLAN_TYPE,
+  type: PLAN_TYPE,
+  carrier: 'BlueCross BlueShield',
+  policyNumber: 'POL-12345',
+  effectiveDate: '2026-01-01',
+  terminationDate: '2026-12-31',
+  renewalDate: '2026-12-31',
+  // Benefits
+  deductible: '1000',
+  outOfPocketMax: '5000',
+  copay: '25',
+  coinsurance: '20',
+  description: 'Automated test plan',
+  // Contributions / Rates
+  employerContribution: '50',
+  employeeContribution: '50',
+  premium: '500',
+  monthlyPremium: '500',
+  // Misc
+  ein: '12-3456789',
+  totalEmployees: '50',
+  eligibleEmployees: '45',
+  street1: '123 Main Street',
+  city: 'Charleston',
+  state: 'SC',
+  zip: '29401',
+  contactFirst: 'John',
+  contactLast: 'Doe',
+  contactEmail: 'john@example.com',
+  contactPhone: '(843) 555-0100',
+  payPeriodsPerYear: '26',
+  waitingPeriodDays: '0',
+};
+
+// ---- Helpers ----
+async function shot(page, name) {
+  const p = path.join(screenshotsDir, name);
+  await page.screenshot({ path: p });
+  console.log(`📸 ${name}`);
+}
+
+async function clickFirstAvailable(page, locators, label) {
+  for (const loc of locators) {
+    try {
+      if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false))) {
+        await loc.first().click({ timeout: 5000 });
+        console.log(`✓ ${label}`);
+        return true;
+      }
+    } catch (e) {
+      // try next
+    }
+  }
+  return false;
+}
+
+async function fillVisibleInputs(page, data) {
+  const inputs = await page.locator('input:visible, textarea:visible').all();
+  console.log(`Found ${inputs.length} visible inputs/textareas`);
+  let filled = 0;
+  const unmatched = [];
+  for (const input of inputs) {
+    try {
+      const type = await input.getAttribute('type');
+      if (['hidden', 'checkbox', 'radio', 'submit', 'button', 'file', 'search'].includes(type)) continue;
+
+      // Identify field by name → formcontrolname → id (Angular reactive forms)
+      const name = (await input.getAttribute('name'))
+        || (await input.getAttribute('formcontrolname'))
+        || (await input.getAttribute('id'))
+        || '';
+
+      const currentValue = await input.inputValue();
+      // Skip if already has a non-zero value (preserve sensible defaults like Annual Maximum=2000)
+      const hasMeaningfulValue = currentValue && currentValue !== '0' && currentValue !== '0.00' && currentValue !== '$0.00';
+      if (hasMeaningfulValue) continue;
+
+      // Special-case: unnamed money inputs in the Rates table (placeholder="0.00")
+      if (!name) {
+        const placeholder = (await input.getAttribute('placeholder')) || '';
+        if (placeholder === '0.00' && !currentValue) {
+          await input.fill('100');
+          console.log(`  ✓ (rate input, placeholder=0.00) = 100`);
+          filled++;
+        }
+        continue;
+      }
+
+      let value = data[name];
+      if (!value) {
+        const lower = name.toLowerCase();
+        if (lower.includes('plan') && lower.includes('name')) value = data.planName;
+        else if (lower.includes('email')) value = data.contactEmail;
+        else if (lower.includes('phone')) value = data.contactPhone;
+        else if (lower.includes('zip') || lower.includes('postal')) value = data.zip;
+        else if (lower.includes('city')) value = data.city;
+        else if (lower.includes('street') || lower.includes('address')) value = data.street1;
+        // Carrier: only the canonical carrier-name field
+        else if (lower === 'carrier' || lower === 'carriername') value = data.carrier;
+        else if (lower.includes('policy')) value = data.policyNumber;
+        else if (lower.includes('deductible')) value = data.deductible;
+        else if (lower.includes('copay')) value = data.copay;
+        // Waiting periods are in months, must be 0-24. Match "wait" anywhere in the name.
+        else if (lower.includes('wait')) value = '0';
+        // Age limits (e.g. dependentAgeOutAge ~ 26)
+        else if (lower.includes('age')) value = '26';
+        // Rates step: premium / monthly / employer cost / employee cost / rate fields
+        else if (lower.includes('premium') || lower === 'rate' || lower.endsWith('rate')) value = data.premium;
+        else if (lower.includes('employercost') || lower.includes('employer_cost')) value = data.employerContribution;
+        else if (lower.includes('employeecost') || lower.includes('employee_cost')) value = data.employeeContribution;
+        // Contributions / participation (percentages)
+        else if (lower.includes('contribution') && lower.includes('pct')) value = '50';
+        else if (lower.includes('contribution')) value = data.employerContribution;
+        else if (lower.includes('participation')) value = '100';
+        // Annual / lifetime maxes — dollars
+        else if (lower.includes('annualmax') || (lower.includes('annual') && lower.includes('max'))) value = '2000';
+        else if (lower.includes('lifetimemax') || (lower.includes('lifetime') && lower.includes('max'))) value = '1500';
+        // Percent fields (preventivePct, basicPct, majorPct, orthodontiaPct, …)
+        else if (lower.endsWith('pct') || lower.includes('percent')) value = '100';
+        // Generic fallback for empty number fields with a name (Rates tier × column inputs)
+        else if (type === 'number' && !currentValue) value = '100';
+      }
+      if (!value) {
+        unmatched.push(name);
+        continue;
+      }
+
+      await input.fill(value);
+      console.log(`  ✓ ${name} = ${value}`);
+      filled++;
+    } catch (e) {
+      // skip
+    }
+  }
+  if (unmatched.length > 0) {
+    console.log(`  ℹ️  unmatched: ${JSON.stringify(unmatched)}`);
+  }
+  return filled;
+}
+
+async function selectVisibleDropdowns(page, data) {
+  const selects = await page.locator('select:visible').all();
+  console.log(`Found ${selects.length} visible selects`);
+  for (const select of selects) {
+    try {
+      const name = (await select.getAttribute('name'))
+        || (await select.getAttribute('formcontrolname'))
+        || (await select.getAttribute('id'))
+        || '';
+
+      // For "plan type" dropdowns, pick the user's PLAN_TYPE by visible label.
+      // We avoid generic name matching here — try labels even when the form-control name is unknown.
+      const lower = name.toLowerCase();
+      const looksLikePlanType =
+        lower.includes('plantype') || lower.includes('plan_type') || lower === 'type';
+
+      if (looksLikePlanType) {
+        try {
+          await select.selectOption({ label: data.planType });
+          console.log(`  ✓ ${name || '(plan type)'} = ${data.planType}`);
+          continue;
+        } catch (e) {
+          // Fall through to name-based / first-option logic
+        }
+      }
+
+      // Specific known field names
+      if (data[name]) {
+        await select.selectOption(data[name]).catch(async () => {
+          await select.selectOption({ label: data[name] });
+        });
+        console.log(`  ✓ ${name} = ${data[name]}`);
+        continue;
+      }
+
+      // Fallback 1: try to find an option whose label matches PLAN_TYPE (covers unnamed plan-type selects)
+      const options = await select.locator('option').all();
+      const optionTexts = [];
+      for (const opt of options) {
+        const t = ((await opt.textContent().catch(() => '')) || '').trim();
+        optionTexts.push(t);
+      }
+      if (optionTexts.includes(data.planType)) {
+        await select.selectOption({ label: data.planType });
+        console.log(`  ✓ ${name || '(unnamed)'} = ${data.planType} (matched by option label)`);
+        continue;
+      }
+
+      // Fallback 2: pick first non-empty option (skip the placeholder)
+      await select.selectOption({ index: 1 }).catch(() => {});
+      const selected = await select.inputValue().catch(() => '');
+      console.log(`  ✓ ${name || '(unnamed)'} = ${selected || '(first option)'}`);
+    } catch (e) {
+      // skip
+    }
+  }
+}
+
+async function tickAllRequiredCheckboxes(page) {
+  // Best-effort: tick checkboxes near "required" labels (avoids T&Cs being blockers).
+  // Skip generic test-mode toggles to avoid surprises.
+  const checkboxes = await page.locator('input[type="checkbox"]:visible').all();
+  for (const cb of checkboxes) {
+    try {
+      const required = await cb.getAttribute('required');
+      const name = (await cb.getAttribute('name')) || '';
+      const lower = name.toLowerCase();
+      if (required !== null || lower.includes('agree') || lower.includes('accept') || lower.includes('terms')) {
+        if (!(await cb.isChecked())) {
+          await cb.check({ force: true });
+          console.log(`  ✓ checked: ${name || '(unnamed)'}`);
+        }
+      }
+    } catch (e) {
+      // skip
+    }
+  }
+}
+
+// ---- Main flow ----
+async function addPlan() {
   const browser = await chromium.launch({ headless: false });
   const page = await browser.newPage();
 
   try {
-    console.log('🚀 Starting Add Plan to Group automation...\n');
+    console.log(`🚀 Adding plan "${PLAN_NAME}" to group "${GROUP_NAME}"\n`);
 
     // Step 1: Login
-    console.log('--- Step 1: Logging in ---');
+    console.log('--- Step 1: Login ---');
     await page.goto(`${process.env.APP_BASE_URL}/login`, { waitUntil: 'networkidle' });
     await page.getByTestId('email-input').fill(credentials.email);
     await page.getByTestId('password-input').fill(credentials.password);
     await page.getByTestId('login-btn').click();
     await page.waitForNavigation({ waitUntil: 'networkidle' });
-    console.log('✓ Login successful!\n');
+    console.log('✓ Logged in\n');
 
-    // Step 2: Navigate to View All Groups
-    console.log('--- Step 2: Navigating to View All Groups ---');
+    // Step 2: Navigate to Groups
+    console.log('--- Step 2: View All Groups ---');
     await page.waitForTimeout(2000);
-    const viewAllGroupsButton = page.getByTestId('view-all-groups');
-    await viewAllGroupsButton.click({ timeout: 5000 });
+    await page.getByTestId('view-all-groups').click({ timeout: 5000 });
     await page.waitForTimeout(2000);
-    console.log('✓ Navigated to groups page\n');
+    console.log('✓ On groups page\n');
 
-    // Step 3: Find and click on the group we created
-    console.log(`--- Step 3: Finding and clicking group "${groupName}" ---`);
-    const groupLink = page.locator(`text=${groupName}`).first();
-    const groupExists = await groupLink.count() > 0;
-    
-    if (!groupExists) {
-      throw new Error(`Group "${groupName}" not found in the groups list`);
-    }
+    // Step 3: Toggle "Show test groups" + search + open the group
+    console.log(`--- Step 3: Open group "${GROUP_NAME}" ---`);
 
-    await groupLink.click({ timeout: 5000 });
-    await page.waitForTimeout(2000);
-    console.log(`✓ Clicked on group "${groupName}"\n`);
-
-    // Take screenshot of group details
-    const groupDetailsScreenshot = path.join(screenshotsDir, 'group_details.png');
-    await page.screenshot({ path: groupDetailsScreenshot });
-    console.log('📸 Screenshot saved: group_details.png\n');
-
-    // Step 4: Click on Plans tab
-    console.log('--- Step 4: Clicking on Plans tab ---');
-    const plansTab = page.locator('button:has-text("Plans"), a:has-text("Plans"), [data-testid*="plans"]').first();
-    const plansTabExists = await plansTab.count() > 0;
-    
-    if (!plansTabExists) {
-      // Try alternative selector
-      const altPlansTab = page.locator('text=Plans').first();
-      if (await altPlansTab.count() > 0) {
-        await altPlansTab.click({ timeout: 5000 });
-      } else {
-        throw new Error('Plans tab not found');
+    const showTest = page.locator('label:has-text("Show test groups") input[type="checkbox"]').first();
+    try {
+      if ((await showTest.count()) > 0 && !(await showTest.isChecked())) {
+        await showTest.check({ timeout: 3000 });
+        console.log('✓ Enabled "Show test groups"');
+        await page.waitForTimeout(800);
       }
-    } else {
-      await plansTab.click({ timeout: 5000 });
+    } catch (e) {
+      console.log(`ℹ️  Could not toggle "Show test groups": ${e.message}`);
     }
 
+    const searchBox = page.locator('input[placeholder*="Search groups"], input[placeholder*="search groups"]').first();
+    if ((await searchBox.count()) > 0) {
+      await searchBox.fill(GROUP_NAME);
+      console.log(`✓ Searched: ${GROUP_NAME}`);
+      await page.waitForTimeout(1500);
+    }
+
+    await shot(page, 'addplan_groups_filtered.png');
+
+    // The group card's "Open" / title is rendered as an <a>, not <button>. Try several locators.
+    const opened = await clickFirstAvailable(page, [
+      page.getByRole('link', { name: 'Open', exact: true }),
+      page.getByRole('link', { name: new RegExp(`^\\s*${GROUP_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`) }),
+      page.locator(`a:visible:has-text("${GROUP_NAME}")`),
+      page.getByRole('heading', { name: GROUP_NAME }),
+      page.locator(`:text-is("${GROUP_NAME}")`),
+    ], 'Opened group');
+
+    if (!opened) {
+      throw new Error(`Group "${GROUP_NAME}" not found. Run addnewgroup.js first.`);
+    }
+
+    await page.waitForTimeout(2500);
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await shot(page, 'addplan_group_details.png');
+    console.log(`✓ Group page loaded: ${page.url()}\n`);
+
+    // Step 4: Plans tab is default after opening a group — but click it just in case
+    console.log('--- Step 4: Ensure Plans tab is active ---');
+    const plansTab = page.getByRole('tab', { name: /^Plans$/ })
+      .or(page.locator('button:visible').filter({ hasText: /^Plans$/ }))
+      .or(page.locator('a:visible').filter({ hasText: /^Plans$/ }));
+    if ((await plansTab.count()) > 0) {
+      await plansTab.first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      console.log('✓ Plans tab active');
+    } else {
+      console.log('ℹ️  Plans tab locator not found — assuming it is already active');
+    }
+    console.log('');
+
+    // Step 5: Click "+ Add Plan"
+    console.log('--- Step 5: Click "+ Add Plan" ---');
+    const addClicked = await clickFirstAvailable(page, [
+      page.locator('[data-testid="add-plan-btn"]'),
+      page.getByRole('button', { name: /^\+\s*Add Plan$/ }),
+      page.locator('button:visible').filter({ hasText: /^\+\s*Add Plan$/ }),
+      page.locator('button:visible').filter({ hasText: /^Add Plan$/ }),
+      page.getByRole('link', { name: /Add Plan/ }),
+    ], 'Clicked "+ Add Plan"');
+    if (!addClicked) {
+      throw new Error('"+ Add Plan" button not found on Plans tab');
+    }
     await page.waitForTimeout(3000);
-    console.log('✓ Plans tab opened\n');
-    console.log(`Current URL after clicking Plans tab: ${page.url()}\n`);
+    await shot(page, 'addplan_after_add_click.png');
+    console.log('');
 
-    // Take screenshot of Plans tab
-    const plansTabScreenshot = path.join(screenshotsDir, 'plans_tab.png');
-    await page.screenshot({ path: plansTabScreenshot });
-    console.log('📸 Screenshot saved: plans_tab.png\n');
-
-    // Step 5: Click +Add Plan button on the Plans tab (not the group page)
-    console.log('--- Step 5: Clicking +Add Plan button on Plans tab ---');
-    
-    // Look for the +Add Plan button specifically on this tab
-    let addPlanButton = page.locator('[data-testid="add-plan-btn"]').first();
-    let buttonCount = await addPlanButton.count();
-    
-    if (buttonCount === 0) {
-      // Try by text
-      addPlanButton = page.locator('button:has-text("+Add Plan")').first();
-      buttonCount = await addPlanButton.count();
-    }
-    
-    if (buttonCount === 0) {
-      // Try broader search
-      addPlanButton = page.locator('button:has-text("Add Plan"), button:has-text("+")').first();
-      buttonCount = await addPlanButton.count();
-    }
-    
-    if (buttonCount > 0) {
-      await addPlanButton.click({ timeout: 5000 });
-      console.log('✓ Clicked +Add Plan button\n');
+    // Step 6: On the "Add Benefit Plans" method screen, pick "Enter Plan Manually".
+    // The cards are styled <div>s (not buttons/links), so target the heading text directly.
+    // Explicitly avoid "Import from Quoting Engine" per the no-quotes rule.
+    console.log('--- Step 6: Choose "Enter Plan Manually" ---');
+    const manualHeading = page.getByText('Enter Plan Manually', { exact: false }).first();
+    if ((await manualHeading.count()) > 0) {
+      await manualHeading.scrollIntoViewIfNeeded().catch(() => {});
+      await manualHeading.click({ timeout: 5000 });
+      console.log('✓ Clicked "Enter Plan Manually" card');
+      await page.waitForTimeout(2500);
+      await page.waitForLoadState('networkidle').catch(() => {});
+      await shot(page, 'addplan_manual_entry.png');
     } else {
-      throw new Error('+Add Plan button not found on Plans tab');
+      console.log('ℹ️  "Enter Plan Manually" card not found — assuming form is shown directly');
     }
+    console.log('');
 
-    // Wait for modal or page to appear
-    await page.waitForTimeout(3000);
-    console.log(`Current URL after clicking +Add Plan: ${page.url()}\n`);
+    // Step 7: Walk through the multi-step wizard.
+    //   - Each step: scroll to top, fill visible inputs/selects/checkboxes, screenshot.
+    //   - Look for "Next" → click and continue.
+    //   - On the last step: look for Save/Create/Submit → click and finish.
+    console.log('--- Step 7: Multi-step wizard ---');
 
-    // Take screenshot of plan type selection page
-    const planTypeScreenshot = path.join(screenshotsDir, 'plan_type_selection.png');
-    await page.screenshot({ path: planTypeScreenshot });
-    console.log('📸 Screenshot saved: plan_type_selection.png\n');
+    // Wizard has exactly 5 steps. Walk through each one filling all visible fields.
+    // The app saves progressively via "Save & Next", so by the end of step 5 the plan exists.
+    const TOTAL_STEPS = 5;
+    let saved = false;
+    let stepsCompleted = 0;
 
-    // Step 6: Scroll down and click "Enter Plan manually" option
-    console.log('--- Step 6: Scrolling down to find "Enter Plan manually" option ---\n');
-    
-    // Get all visible text on page first
-    const bodyText = await page.locator('body').textContent();
-    console.log('Checking if page contains "Enter Plan manually" text...');
-    if (bodyText.includes('Enter Plan manually')) {
-      console.log('✓ Page contains "Enter Plan manually" text\n');
-    } else {
-      console.log('⚠️ "Enter Plan manually" text not found on initial load\n');
-    }
-    
-    // Scroll down gradually and look for the button at each step
-    let foundManual = false;
-    
-    for (let scrollCount = 0; scrollCount < 5 && !foundManual; scrollCount++) {
-      console.log(`Scroll attempt ${scrollCount + 1}...`);
-      
-      await page.evaluate(() => {
-        window.scrollBy(0, 300);
-      });
+    for (let step = 1; step <= TOTAL_STEPS; step++) {
+      console.log(`\n  ▶ Wizard step ${step}`);
+      await page.waitForLoadState('networkidle').catch(() => {});
+      await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(800);
-      
-      // After each scroll, look for the button
-      const allElements = await page.locator('button, a, [role="button"]').all();
-      
-      for (const elem of allElements) {
-        const text = await elem.textContent();
-        const visible = await elem.isVisible().catch(() => false);
-        
-        if (visible && text) {
-          const textLower = text.toLowerCase();
-          if (textLower.includes('enter plan manually') || textLower.includes('enter manually')) {
-            console.log(`✓ Found at scroll ${scrollCount + 1}: "${text.trim()}"\n`);
-            
-            // Scroll element into view and click
-            await elem.scrollIntoViewIfNeeded();
-            await page.waitForTimeout(500);
-            await elem.click({ timeout: 5000 });
-            console.log('✓ Successfully clicked "Enter Plan manually"\n');
-            foundManual = true;
+
+      const inputCount = await fillVisibleInputs(page, planData);
+      await selectVisibleDropdowns(page, planData);
+      await tickAllRequiredCheckboxes(page);
+      await page.waitForTimeout(500);
+      await shot(page, `addplan_step${step}.png`);
+      console.log(`  ✓ Step ${step}: filled ${inputCount} inputs`);
+
+      // Scroll to bottom so Next/Save is in view
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(500);
+
+      // Try terminal action first (Save / Create Plan / Submit / Finish)
+      const terminalLocators = [
+        page.getByRole('button', { name: /^Save Plan$/ }),
+        page.getByRole('button', { name: /^Save$/ }),
+        page.getByRole('button', { name: /^Create Plan$/ }),
+        page.getByRole('button', { name: /^Create$/ }),
+        page.getByRole('button', { name: /^Submit$/ }),
+        page.getByRole('button', { name: /^Finish$/ }),
+        page.getByRole('button', { name: /^Confirm$/ }),
+      ];
+      let terminalClicked = false;
+      for (const loc of terminalLocators) {
+        try {
+          if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false)) && (await loc.first().isEnabled().catch(() => false))) {
+            const text = (await loc.first().textContent().catch(() => '')) || '';
+            await loc.first().click({ timeout: 5000 });
+            console.log(`  ✓ Step ${step}: clicked terminal button "${text.trim()}"`);
+            terminalClicked = true;
             break;
           }
+        } catch (e) {
+          // try next
         }
       }
-    }
-    
-    if (!foundManual) {
-      console.log('⚠️ Could not find "Enter Plan manually" button after scrolling.\n');
-      console.log('The form might be displayed directly or the button might have a different label.\n');
-    }
-    
-    // Take screenshot after scrolling
-    const afterScrollScreenshot = path.join(screenshotsDir, 'after_scroll_final.png');
-    await page.screenshot({ path: afterScrollScreenshot });
-    console.log('📸 Screenshot saved: after_scroll_final.png\n');
-    
-    await page.waitForTimeout(2000);
-
-    await page.waitForTimeout(2000);
-
-    // Take screenshot of plan form
-    const planFormScreenshot = path.join(screenshotsDir, 'plan_form_initial.png');
-    await page.screenshot({ path: planFormScreenshot });
-    console.log('📸 Screenshot saved: plan_form_initial.png\n');
-
-    // Step 7: Fill in ALL visible form fields
-    console.log('--- Step 7: Filling ALL visible form fields ---\n');
-
-    // Scroll to top first
-    await page.evaluate(() => {
-      window.scrollTo(0, 0);
-    });
-    await page.waitForTimeout(1000);
-
-    // Define comprehensive plan and company data
-    const formData = {
-      'name': 'Health Insurance Plan - ' + new Date().toISOString().slice(0, 10),
-      'ein': '12-3456789',
-      'sicCode': '7372',
-      'naicsCode': '541511',
-      'industry': 'Technology',
-      'dbaName': 'HR Tech Company',
-      'website': 'https://example.com',
-      'effectiveDate': '2026-01-01',
-      'renewalDate': '2026-12-31',
-      'totalEmployees': '50',
-      'eligibleEmployees': '45',
-      'street1': '123 Main Street',
-      'city': 'Charleston',
-      'zip': '29401',
-      'contactFirst': 'John',
-      'contactLast': 'Doe',
-      'contactEmail': 'john@example.com',
-      'contactPhone': '(843) 555-0100',
-      'payPeriodsPerYear': '26',
-      'waitingPeriodDays': '0'
-    };
-
-    // Get all visible input fields
-    const inputs = await page.locator('input:visible').all();
-    console.log(`Found ${inputs.length} visible input fields\n`);
-
-    for (const input of inputs) {
-      try {
-        const name = await input.getAttribute('name');
-        const type = await input.getAttribute('type');
-        const id = await input.getAttribute('id');
-        
-        if (!name || type === 'hidden') continue;
-
-        const value = await input.inputValue();
-        
-        // Skip if already filled or is a special type
-        if (value || type === 'checkbox' || type === 'radio' || type === 'submit' || type === 'button') {
-          continue;
-        }
-
-        // Fill based on field name
-        if (formData[name]) {
-          await input.fill(formData[name]);
-          console.log(`✓ Filled ${name}: ${formData[name]}`);
-        } else if (name && name.includes('email')) {
-          await input.fill(formData.contactEmail);
-          console.log(`✓ Filled ${name}: ${formData.contactEmail}`);
-        } else if (name && (name.includes('phone') || name.includes('phone'))) {
-          await input.fill(formData.contactPhone);
-          console.log(`✓ Filled ${name}: ${formData.contactPhone}`);
-        }
-      } catch (e) {
-        // Skip fields that can't be filled
+      if (terminalClicked) {
+        saved = true;
+        stepsCompleted = step;
+        await page.waitForTimeout(2500);
+        break;
       }
-    }
 
-    console.log('\n');
-
-    // Fill select dropdowns
-    console.log('Filling select fields...\n');
-    const selects = await page.locator('select:visible').all();
-    console.log(`Found ${selects.length} visible select fields\n`);
-
-    for (const select of selects) {
-      const name = await select.getAttribute('name');
-      const id = await select.getAttribute('id');
-      
-      if (name === 'state') {
-        await select.selectOption('SC');
-        console.log('✓ Selected State: SC');
-      } else if (name === 'waitingPeriodEffectiveRule') {
-        // Try to select the first non-empty option
-        await select.selectOption('0');
-        console.log('✓ Selected Waiting Period Rule: 0');
-      } else if (name === 'payPeriodsPerYear') {
-        await select.selectOption('26');
-        console.log('✓ Selected Pay Periods: 26');
+      // Otherwise advance with Next / Save & Next / Continue. Button may include an arrow ("Next →").
+      const nextLocators = [
+        page.getByRole('button', { name: /^Save\s*&\s*Next/ }),
+        page.getByRole('button', { name: /^Next\b/ }),
+        page.getByRole('button', { name: /^Continue\b/ }),
+        page.getByRole('button', { name: /^Next Step\b/ }),
+        page.locator('button:visible').filter({ hasText: /^Next/ }),
+      ];
+      let advanced = false;
+      for (const loc of nextLocators) {
+        try {
+          if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false)) && (await loc.first().isEnabled().catch(() => false))) {
+            await loc.first().click({ timeout: 5000 });
+            console.log(`  ✓ Step ${step}: clicked Next`);
+            advanced = true;
+            break;
+          }
+        } catch (e) {
+          // try next
+        }
       }
+      if (!advanced) {
+        console.log(`  ⚠️  Step ${step}: no Next/Save button found — stopping wizard`);
+        stepsCompleted = step;
+        break;
+      }
+      await page.waitForTimeout(2500);
+      stepsCompleted = step;
     }
 
-    console.log('\n');
+    // If we completed all 5 wizard steps, the plan is saved progressively via Save & Next.
+    if (stepsCompleted >= TOTAL_STEPS) saved = true;
 
-    // Take screenshot after filling form
-    const filledFormScreenshot = path.join(screenshotsDir, 'plan_form_filled_comprehensive.png');
-    await page.screenshot({ path: filledFormScreenshot });
-    console.log('📸 Screenshot saved: plan_form_filled_comprehensive.png\n');
+    await page.waitForTimeout(3500);
+    await shot(page, 'addplan_after_submit.png');
 
-    // Step 8: Submit the form
-    console.log('--- Step 8: Submitting form ---');
-    
-    // Scroll down to see the submit button
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight);
-    });
-    await page.waitForTimeout(1500);
-    
-    // Take screenshot of bottom of form
-    const beforeSubmitScreenshot = path.join(screenshotsDir, 'before_submit.png');
-    await page.screenshot({ path: beforeSubmitScreenshot });
-    console.log('📸 Screenshot saved: before_submit.png\n');
-    
-    // Look for submit button - try various selectors
-    let submitButton = page.locator('button:has-text("Create Group & Start Setup")').first();
-    let submitCount = await submitButton.count();
-    
-    if (submitCount === 0) {
-      submitButton = page.locator('button:has-text("Submit"), button:has-text("Save"), button:has-text("Create"), button:has-text("Add")').first();
-      submitCount = await submitButton.count();
-    }
-    
-    if (submitCount === 0) {
-      submitButton = page.locator('button[type="submit"]').first();
-      submitCount = await submitButton.count();
-    }
-    
-    if (submitCount > 0) {
-      const buttonText = await submitButton.textContent();
-      console.log(`✓ Found submit button: "${buttonText.trim()}"\n`);
-      await submitButton.click({ timeout: 5000 });
-      console.log('✓ Clicked submit button\n');
-      
-      await page.waitForTimeout(3000);
-      
-      const submittedScreenshot = path.join(screenshotsDir, 'after_form_submitted.png');
-      await page.screenshot({ path: submittedScreenshot });
-      console.log('📸 Screenshot saved: after_form_submitted.png\n');
-      
-      console.log(`✅ Form submitted successfully!`);
-      console.log(`Final URL: ${page.url()}\n`);
-      console.log('📁 All screenshots saved in:', screenshotsDir);
+    if (saved) {
+      console.log(`\n✅ Plan "${PLAN_NAME}" saved (after ${stepsCompleted} wizard step(s))`);
     } else {
-      console.log('⚠️ Submit button not found.');
-      const allButtons = await page.locator('button').all();
-      console.log(`\nAvailable buttons on this page:\n`);
-      for (const btn of allButtons) {
-        const text = await btn.textContent();
-        const visible = await btn.isVisible().catch(() => false);
-        if (visible && text && text.trim()) {
-          console.log(`  - "${text.trim()}"`);
-        }
-      }
+      console.log(`\n⚠️  Wizard did not reach a Save action (stopped after ${stepsCompleted} step(s))`);
+      process.exitCode = 1;
     }
-
+    console.log(`Final URL: ${page.url()}`);
   } catch (error) {
-    console.error('❌ Error:', error.message);
-    const errorScreenshot = path.join(screenshotsDir, 'plan_error.png');
-    try {
-      await page.screenshot({ path: errorScreenshot });
-      console.log(`📸 Error screenshot saved: plan_error.png`);
-    } catch (e) {
-      console.log('Could not capture error screenshot');
-    }
+    console.error(`\n❌ Failed: ${error.message}`);
+    await shot(page, 'addplan_error.png').catch(() => {});
+    process.exitCode = 1;
   } finally {
     await browser.close();
   }
 }
 
-addPlanToGroup();
+addPlan();

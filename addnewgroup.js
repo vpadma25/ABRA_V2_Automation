@@ -21,13 +21,20 @@ const credentials = {
   password: process.env.TEST_USER_PASSWORD
 };
 
-// Group form data - adjust these based on your mandatory fields
+// Group form data - mandatory fields for the New Group form
 const groupData = {
-  name: 'Test Group ' + new Date().toISOString().slice(0, 10),
-  description: 'Automated test group created by Playwright',
-  // Add more fields if needed, e.g.:
-  // category: 'General',
-  // members: 'test@example.com'
+  name: 'QA-Test_' + new Date().toISOString().slice(0, 10),
+  ein: '12-3456789',
+  effectiveDate: '2026-01-01',
+  renewalDate: '2026-12-31',
+  street1: '123 Main Street',
+  city: 'Charleston',
+  state: 'SC',
+  zip: '29401',
+  contactFirst: 'John',
+  contactLast: 'Doe',
+  contactEmail: 'john@example.com',
+  contactPhone: '(843) 555-0100'
 };
 
 async function addNewGroup() {
@@ -62,18 +69,23 @@ async function addNewGroup() {
     await page.screenshot({ path: loginScreenshot });
     console.log('📸 Login screenshot saved');
 
-    // Step 2: Click +New Group button on Dashboard
-    console.log('\n--- Step 2: Clicking +New Group button ---');
-
-    // Wait for dashboard to load
+    // Step 2a: Navigate to groups page via "View All Groups"
+    console.log('\n--- Step 2a: Clicking View All Groups ---');
     await page.waitForTimeout(2000);
+    const viewAllGroupsButton = page.getByTestId('view-all-groups');
+    await viewAllGroupsButton.click({ timeout: 5000 });
+    await page.waitForTimeout(2000);
+    console.log('✓ Navigated to groups page');
+
+    // Step 2b: Click +New Group button on the groups page
+    console.log('\n--- Step 2b: Clicking +New Group button ---');
 
     // Try different selectors for +New Group button
     const newGroupSelectors = [
+      '[data-testid="new-group-btn"]',
       'button:has-text("+New Group")',
       'button:has-text("New Group")',
       'button:has-text("+ New Group")',
-      '[data-testid="new-group-btn"]',
       '.new-group-btn',
       '#new-group-btn',
       'button[class*="new-group"]'
@@ -104,79 +116,54 @@ async function addNewGroup() {
     // Step 3: Fill mandatory fields
     console.log('\n--- Step 3: Filling mandatory fields ---');
 
-    // Fill group name (mandatory)
-    const nameSelectors = [
-      'input[name="name"]',
-      'input[name="groupName"]',
-      'input[placeholder*="name"]',
-      'input[placeholder*="Name"]',
-      '[data-testid="group-name-input"]'
-    ];
+    await page.locator('input[name="name"]').fill(groupData.name);
+    console.log(`✓ Company Name: ${groupData.name}`);
 
-    let nameFilled = false;
-    for (const selector of nameSelectors) {
-      try {
-        const field = page.locator(selector);
-        if (await field.isVisible({ timeout: 3000 })) {
-          await field.fill(groupData.name);
-          console.log(`✓ Filled group name: ${groupData.name}`);
-          nameFilled = true;
-          break;
-        }
-      } catch (e) {
-        continue;
+    await page.locator('input[name="ein"]').fill(groupData.ein);
+    console.log(`✓ EIN: ${groupData.ein}`);
+
+    await page.locator('input[name="effectiveDate"]').fill(groupData.effectiveDate);
+    console.log(`✓ Effective Date: ${groupData.effectiveDate}`);
+
+    await page.locator('input[name="renewalDate"]').fill(groupData.renewalDate);
+    console.log(`✓ Renewal Date: ${groupData.renewalDate}`);
+
+    await page.locator('input[name="street1"]').fill(groupData.street1);
+    console.log(`✓ Street: ${groupData.street1}`);
+
+    await page.locator('input[name="city"]').fill(groupData.city);
+    console.log(`✓ City: ${groupData.city}`);
+
+    // State: try select first, fall back to input
+    try {
+      const stateSelect = page.locator('select[name="state"]');
+      if (await stateSelect.count() > 0) {
+        await stateSelect.selectOption(groupData.state);
+        console.log(`✓ State: ${groupData.state}`);
+      } else {
+        await page.locator('input[name="state"]').fill(groupData.state);
+        console.log(`✓ State (input): ${groupData.state}`);
       }
+    } catch (e) {
+      console.log(`⚠️  State field issue: ${e.message}`);
     }
 
-    if (!nameFilled) {
-      throw new Error('Group name field not found');
-    }
+    await page.locator('input[name="zip"]').fill(groupData.zip);
+    console.log(`✓ ZIP: ${groupData.zip}`);
 
-    // Fill description (mandatory)
-    const descSelectors = [
-      'textarea[name="description"]',
-      'input[name="description"]',
-      'textarea[placeholder*="description"]',
-      'textarea[placeholder*="Description"]',
-      '[data-testid="group-description-input"]'
-    ];
+    await page.locator('input[name="contactFirst"]').fill(groupData.contactFirst);
+    console.log(`✓ Contact First: ${groupData.contactFirst}`);
 
-    let descFilled = false;
-    for (const selector of descSelectors) {
-      try {
-        const field = page.locator(selector);
-        if (await field.isVisible({ timeout: 3000 })) {
-          await field.fill(groupData.description);
-          console.log(`✓ Filled description: ${groupData.description}`);
-          descFilled = true;
-          break;
-        }
-      } catch (e) {
-        continue;
-      }
-    }
+    await page.locator('input[name="contactLast"]').fill(groupData.contactLast);
+    console.log(`✓ Contact Last: ${groupData.contactLast}`);
 
-    if (!descFilled) {
-      throw new Error('Description field not found');
-    }
+    await page.locator('input[name="contactEmail"]').fill(groupData.contactEmail);
+    console.log(`✓ Contact Email: ${groupData.contactEmail}`);
 
-    // Add more mandatory fields here if needed
-    // Example: Category dropdown
-    /*
-    const categorySelectors = ['select[name="category"]', '[data-testid="category-select"]'];
-    for (const selector of categorySelectors) {
-      try {
-        const select = page.locator(selector);
-        if (await select.isVisible({ timeout: 3000 })) {
-          await select.selectOption(groupData.category);
-          console.log(`✓ Selected category: ${groupData.category}`);
-          break;
-        }
-      } catch (e) {
-        continue;
-      }
-    }
-    */
+    await page.locator('input[name="contactPhone"]').fill(groupData.contactPhone);
+    console.log(`✓ Contact Phone: ${groupData.contactPhone}`);
+
+    await page.waitForTimeout(1000);
 
     // Capture form filled screenshot
     const formScreenshot = path.join(screenshotsDir, 'addnewgroup_form_filled.png');
@@ -188,12 +175,13 @@ async function addNewGroup() {
 
     // Look for submit button
     const submitSelectors = [
+      'button:has-text("Create Group & Start Setup")',
+      'button:has-text("Create Group")',
+      '[data-testid="create-group-btn"]',
       'button[type="submit"]',
       'button:has-text("Create")',
       'button:has-text("Save")',
-      'button:has-text("Add Group")',
-      'button:has-text("Submit")',
-      '[data-testid="submit-btn"]'
+      'button:has-text("Submit")'
     ];
 
     let submitFound = false;
@@ -234,7 +222,6 @@ async function addNewGroup() {
       timestamp: new Date().toISOString(),
       loginEmail: credentials.email,
       groupName: groupData.name,
-      groupDescription: groupData.description,
       status: 'SUCCESS',
       screenshots: [loginScreenshot, formScreenshot, successScreenshot]
     };

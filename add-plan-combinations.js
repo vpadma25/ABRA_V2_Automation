@@ -16,6 +16,26 @@ const TODAY = TIMESTAMP.slice(0, 10);
 const GROUP_NAME = process.env.GROUP_NAME || `QA-Combo_${TODAY}_${RUN_ID}`;
 const PLAN_TYPE = process.env.PLAN_TYPE || 'Dental';
 const MAX_COMBOS = parseInt(process.env.MAX_COMBOS || '5', 10);
+const SKIP_COMBOS = parseInt(process.env.SKIP_COMBOS || '0', 10);
+
+// Baseline of options discovered in earlier runs. Used when SKIP_COMBOS > 0 so we can
+// jump directly to a later slice without spending plan #1 on rediscovery. The script
+// still verifies these against the live wizard on plan #1 and warns on mismatch.
+const KNOWN_RATING = [
+  { value: 'COMPOSITE', label: 'Composite (4-tier)' },
+  { value: 'TWO_TIER', label: '2-Tier (EE, EE+Family)' },
+  { value: 'THREE_TIER', label: '3-Tier (EE, EE+One, EE+Two+)' },
+  { value: 'SIX_TIER', label: '6-Tier (EE, ES, EC, ECH, ESC, ESCH)' },
+  { value: 'AGE_BANDED', label: 'Age-Banded' },
+  { value: 'ACA', label: 'ACA Individual Age-Rated' },
+  { value: 'VOLUME_BASED', label: 'Volume-Based (per $1K)' },
+  { value: 'BANDED', label: 'Banded (EE age only)' },
+];
+const KNOWN_CONTRIB = [
+  { value: 'PERCENTAGE', label: 'Percentage of Premium' },
+  { value: 'FLAT_DOLLAR', label: 'Flat Dollar Amount' },
+  { value: 'DEFINED_CONTRIBUTION', label: 'Defined Contribution' },
+];
 
 const screenshotsDir = path.join(__dirname, 'screenshots');
 const reportsDir = path.join(__dirname, 'reports');
@@ -450,60 +470,67 @@ async function main() {
     groupUrl = page.url();
     console.log(`✓ Group created: ${groupUrl}\n`);
 
-    // Plan 1: discover options + create with combo[0]
-    console.log('=== Plan 1 (discovery + create) ===');
-    await page.goto(groupUrl, { waitUntil: 'networkidle' }).catch(() => {});
-    await page.waitForTimeout(1500);
-    await startAddPlan(page);
-
-    const tempName = `QA-Plan_TEMP_${RUN_ID}`;
-    const tempData = buildPlanData(tempName);
-    const w1 = await walkWizard(page, tempData, null, null, { rating: true, contrib: true });
-    discoveredRating = w1.discoveredRating;
-    discoveredContrib = w1.discoveredContrib;
-
-    console.log(`\n📋 Discovered Rating Structures (${discoveredRating.length}):`);
-    discoveredRating.forEach((o, i) => console.log(`  [${i}] ${o.label} (${o.value})`));
-    console.log(`\n📋 Discovered Contribution Types (${discoveredContrib.length}):`);
-    discoveredContrib.forEach((o, i) => console.log(`  [${i}] ${o.label} (${o.value})`));
-    console.log('');
-
-    // Record plan 1 result with whatever values the wizard auto-picked
-    results.push({
-      n: 1,
-      ratingStructure: discoveredRating[0]?.label || 'auto',
-      contributionType: discoveredContrib[0]?.label || 'auto',
-      planName: tempName,
-      status: w1.stepsCompleted >= 5 ? 'PASS' : 'PARTIAL',
-      stepsCompleted: w1.stepsCompleted,
-      url: page.url(),
-    });
-    console.log(`Plan 1 done: steps ${w1.stepsCompleted}/5\n`);
-
-    // Build cross product (rating × contribution), skip first since we already created it
-    const combinations = [];
+    // Build cross product (rating × contribution) from the known baseline.
+    // Plan #1 in the slice will also re-discover options against the live wizard
+    // and warn if the runtime list differs from KNOWN_*.
+    discoveredRating = KNOWN_RATING;
+    discoveredContrib = KNOWN_CONTRIB;
+    const allCombos = [];
     for (const r of discoveredRating) {
       for (const c of discoveredContrib) {
-        combinations.push({ r, c });
+        allCombos.push({ r, c });
       }
     }
-    console.log(`Total possible combinations: ${combinations.length}. Will create ${Math.min(MAX_COMBOS, combinations.length) - 1} more (plus the discovery plan = ${Math.min(MAX_COMBOS, combinations.length)} total).\n`);
 
-    // Plans 2..MAX_COMBOS: explicit (R, C) values
-    for (let i = 1; i < MAX_COMBOS && i < combinations.length; i++) {
-      const { r, c } = combinations[i];
+    const slice = allCombos.slice(SKIP_COMBOS, SKIP_COMBOS + MAX_COMBOS);
+    console.log(`Total combinations: ${allCombos.length}. Will create ${slice.length} (skipping first ${SKIP_COMBOS}, then ${slice.length} starting from #${SKIP_COMBOS + 1}).\n`);
+
+    for (let i = 0; i < slice.length; i++) {
+      const { r, c } = slice[i];
+      const overallIdx = SKIP_COMBOS + i + 1;
       const planName = `QA-Plan_${safeForName(r.label)}_${safeForName(c.label)}_${RUN_ID}`;
-      console.log(`=== Plan ${i + 1}: ${r.label} × ${c.label} ===`);
+      console.log(`=== Plan ${overallIdx}: ${r.label} × ${c.label} ===`);
       const planData = buildPlanData(planName);
+      const isFirst = i === 0;
 
       try {
-        // Back to group, start fresh
         await page.goto(groupUrl, { waitUntil: 'networkidle' }).catch(() => {});
         await page.waitForTimeout(1500);
         await startAddPlan(page);
-        const w = await walkWizard(page, planData, r.value, c.value, {});
+
+        // On the first plan of this batch, also read the live dropdown options
+        // to verify they match KNOWN_* (warn but continue if they differ).
+        const w = await walkWizard(page, planData, r.value, c.value, isFirst ? { rating: true, contrib: true } : {});
+
+        if (isFirst) {
+          if (w.discoveredRating.length > 0) {
+            const liveLabels = w.discoveredRating.map(o => o.label).sort();
+            const knownLabels = KNOWN_RATING.map(o => o.label).sort();
+            if (JSON.stringify(liveLabels) !== JSON.stringify(knownLabels)) {
+              console.log(`⚠️  Rating Structure options differ from KNOWN_RATING:`);
+              console.log(`   live:  ${JSON.stringify(liveLabels)}`);
+              console.log(`   known: ${JSON.stringify(knownLabels)}`);
+            } else {
+              console.log(`✓ Rating Structure options match KNOWN_RATING (${liveLabels.length})`);
+            }
+            discoveredRating = w.discoveredRating;
+          }
+          if (w.discoveredContrib.length > 0) {
+            const liveLabels = w.discoveredContrib.map(o => o.label).sort();
+            const knownLabels = KNOWN_CONTRIB.map(o => o.label).sort();
+            if (JSON.stringify(liveLabels) !== JSON.stringify(knownLabels)) {
+              console.log(`⚠️  Contribution Type options differ from KNOWN_CONTRIB:`);
+              console.log(`   live:  ${JSON.stringify(liveLabels)}`);
+              console.log(`   known: ${JSON.stringify(knownLabels)}`);
+            } else {
+              console.log(`✓ Contribution Type options match KNOWN_CONTRIB (${liveLabels.length})`);
+            }
+            discoveredContrib = w.discoveredContrib;
+          }
+        }
+
         results.push({
-          n: i + 1,
+          n: overallIdx,
           ratingStructure: r.label,
           contributionType: c.label,
           planName,
@@ -511,18 +538,18 @@ async function main() {
           stepsCompleted: w.stepsCompleted,
           url: page.url(),
         });
-        console.log(`Plan ${i + 1} done: steps ${w.stepsCompleted}/5\n`);
+        console.log(`Plan ${overallIdx} done: steps ${w.stepsCompleted}/5\n`);
       } catch (e) {
-        await shot(page, `combo_plan${i + 1}_error.png`);
+        await shot(page, `combo_plan${overallIdx}_error.png`);
         results.push({
-          n: i + 1,
+          n: overallIdx,
           ratingStructure: r.label,
           contributionType: c.label,
           planName,
           status: 'FAIL',
           error: e.message,
         });
-        console.log(`Plan ${i + 1} FAILED: ${e.message}\n`);
+        console.log(`Plan ${overallIdx} FAILED: ${e.message}\n`);
       }
     }
   } catch (e) {

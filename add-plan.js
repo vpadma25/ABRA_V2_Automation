@@ -405,6 +405,219 @@ async function addEmployees(page, groupUrl, count = 2) {
   return results;
 }
 
+// Build short test data for a contribution strategy (all fields kept under 15 chars).
+function buildStrategyData() {
+  const ts4 = String(Date.now()).slice(-4);
+  const shortName = `QAStrat_${ts4}`; // 12 chars
+  return {
+    // Variations of common form field names — fillVisibleInputs will match whatever the form uses.
+    name: shortName,
+    strategyName: shortName,
+    contributionStrategyName: shortName,
+    title: shortName,
+    description: 'Auto test',         // 9
+    effectiveDate: '2026-01-01',      // 10
+    startDate: '2026-01-01',
+    terminationDate: '2026-12-31',    // 10
+    endDate: '2026-12-31',
+    renewalDate: '2026-12-31',
+    employerPct: '50',
+    employerContributionPct: '50',
+    employerContribution: '50',
+    employeePct: '50',
+    employeeContributionPct: '50',
+    amount: '100',
+    contributionAmount: '100',
+    employerAmount: '50',
+    employeeAmount: '50',
+  };
+}
+
+async function addStrategy(page, groupUrl) {
+  console.log('\n--- Step 10: Add Contribution Strategy ---');
+  const stratData = buildStrategyData();
+  console.log(`  ▶ Strategy: ${stratData.name}`);
+
+  // Navigate back to group page so we're in a clean state
+  await page.goto(groupUrl, { waitUntil: 'networkidle' }).catch(() => {});
+  await page.waitForTimeout(2500);
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  // Click the Contributions tab. May include a count badge ("Contributions 2").
+  const tabClicked = await clickFirstAvailable(page, [
+    page.locator('[data-testid="contributions-tab"]'),
+    page.locator('button:visible').filter({ hasText: /^Contributions(\s+\d+)?$/ }),
+    page.getByRole('button', { name: /^Contributions(\s+\d+)?$/ }),
+    page.locator('[role="tab"]').filter({ hasText: /^Contributions(\s+\d+)?$/ }),
+  ], 'Clicked Contributions tab');
+  if (!tabClicked) {
+    throw new Error('Contributions tab not found on group page');
+  }
+  await page.waitForTimeout(2000);
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await shot(page, 'addstrategy_tab.png');
+
+  // Click "+ New Strategy" (try several label variations)
+  const addClicked = await clickFirstAvailable(page, [
+    page.locator('[data-testid="new-strategy-btn"]'),
+    page.locator('[data-testid="add-strategy-btn"]'),
+    page.getByRole('button', { name: /^\+\s*New Strategy$/ }),
+    page.getByRole('button', { name: /^New Strategy$/ }),
+    page.getByRole('button', { name: /^\+\s*Add Strategy$/ }),
+    page.locator('button:visible').filter({ hasText: /^\+\s*New Strategy$/ }),
+    page.locator('button:visible').filter({ hasText: /New Strategy/ }),
+    page.locator('button:visible').filter({ hasText: /Add Strategy/ }),
+  ], 'Clicked "+ New Strategy"');
+  if (!addClicked) {
+    throw new Error('"+ New Strategy" button not found on Contributions tab');
+  }
+  await page.waitForTimeout(2500);
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await shot(page, 'addstrategy_form_opened.png');
+
+  // Strategy form opens in a modal dialog. Scope all locators to the modal so labels
+  // like "Effective Date" / "Strategy Type" don't collide with elements elsewhere on the page.
+  function modalScope() {
+    return page.locator('[role="dialog"], .modal, [class*="modal-content"]').filter({
+      hasText: /New Contribution Strategy|Strategy Details|Strategy Type/,
+    }).first();
+  }
+
+  async function fillStrategyStep1() {
+    let n = 0;
+    const modal = modalScope();
+    // Name — placeholder "Standard Medical — 75% ER" (em-dash, use regex)
+    try {
+      await modal.getByPlaceholder(/Standard Medical/).fill(stratData.name);
+      console.log(`    ✓ Name = ${stratData.name}`); n++;
+    } catch (e) {
+      try { await modal.getByLabel(/^Name/).fill(stratData.name); console.log(`    ✓ Name = ${stratData.name}`); n++; }
+      catch (e2) { console.log(`    ⚠️  Name fill failed: ${e2.message.split('\n')[0]}`); }
+    }
+    // Description — placeholder "Describe this strategy"
+    try {
+      await modal.getByPlaceholder('Describe this strategy').fill(stratData.description);
+      console.log(`    ✓ Description = ${stratData.description}`); n++;
+    } catch (e) {
+      try { await modal.getByLabel(/^Description/).fill(stratData.description); console.log(`    ✓ Description`); n++; }
+      catch (e2) { console.log(`    ⚠️  Description fill failed: ${e2.message.split('\n')[0]}`); }
+    }
+    // Effective Date — the modal has a single date-typed input ("dd-mm-yyyy" placeholder).
+    // The form's <label> isn't associated via `for=`, so target the input directly by type/placeholder.
+    try {
+      const dateLoc = modal.locator('input[type="date"]')
+        .or(modal.getByPlaceholder('dd-mm-yyyy'))
+        .first();
+      await dateLoc.fill('2026-01-01', { timeout: 5000 });
+      console.log(`    ✓ Effective Date = 2026-01-01`); n++;
+    } catch (e) {
+      console.log(`    ⚠️  Effective Date fill failed: ${e.message.split('\n')[0]}`);
+    }
+    // Strategy Type — modal has 2 visible <select>s: [0] Group (pre-set), [1] Strategy Type.
+    try {
+      const selects = await modal.locator('select:visible').all();
+      // Choose the LAST visible select (Strategy Type) to avoid overwriting Group selection
+      const target = selects[selects.length - 1];
+      if (target) {
+        await target.selectOption({ index: 1 });
+        console.log(`    ✓ Strategy Type (first option)`); n++;
+      } else {
+        console.log(`    ⚠️  Strategy Type select not found in modal`);
+      }
+    } catch (e) {
+      console.log(`    ⚠️  Strategy Type select failed: ${e.message.split('\n')[0]}`);
+    }
+    return n;
+  }
+
+  const MAX_FORM_STEPS = 4;
+  let stratSaved = false;
+  for (let step = 1; step <= MAX_FORM_STEPS; step++) {
+    await page.waitForTimeout(700);
+    // On step 1 the strategy details fields use labels — fill those first
+    if (step === 1) await fillStrategyStep1();
+    // Then run the generic fill for any other inputs/selects on this step
+    const filled = await fillVisibleInputs(page, stratData);
+    await selectVisibleDropdowns(page, stratData);
+    await tickAllRequiredCheckboxes(page);
+    await page.waitForTimeout(500);
+    await shot(page, `addstrategy_step${step}.png`);
+    console.log(`    ✓ Form step ${step}: filled ${filled} additional inputs`);
+
+    // Try terminal action first (Save / Create Strategy / Submit / Finish)
+    const terminalLocators = [
+      page.getByRole('button', { name: /^Save Strategy$/ }),
+      page.getByRole('button', { name: /^Create Strategy$/ }),
+      page.getByRole('button', { name: /^Add Strategy$/ }),
+      page.getByRole('button', { name: /^Save$/ }),
+      page.getByRole('button', { name: /^Create$/ }),
+      page.getByRole('button', { name: /^Submit$/ }),
+      page.getByRole('button', { name: /^Finish$/ }),
+      page.getByRole('button', { name: /^Done$/ }),
+    ];
+    let terminalClicked = false;
+    for (const loc of terminalLocators) {
+      try {
+        if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false)) && (await loc.first().isEnabled().catch(() => false))) {
+          const text = (await loc.first().textContent().catch(() => '')) || '';
+          await loc.first().click({ timeout: 5000 });
+          console.log(`    ✓ Step ${step}: clicked terminal button "${text.trim()}"`);
+          terminalClicked = true;
+          break;
+        }
+      } catch (e) {
+        // try next
+      }
+    }
+    if (terminalClicked) {
+      stratSaved = true;
+      await page.waitForTimeout(2500);
+      break;
+    }
+
+    // Otherwise advance — modal button labels include "Next: Rules", "Next: Plans", etc.
+    const nextLocators = [
+      page.getByRole('button', { name: /^Next:/ }),
+      page.locator('button:visible').filter({ hasText: /^Next:/ }),
+      page.getByRole('button', { name: /^Save\s*&\s*Next/ }),
+      page.getByRole('button', { name: /^Next\b/ }),
+      page.locator('button:visible').filter({ hasText: /^Next/ }),
+      page.getByRole('button', { name: /^Continue\b/ }),
+    ];
+    let advanced = false;
+    let advancedText = '';
+    for (const loc of nextLocators) {
+      try {
+        if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false)) && (await loc.first().isEnabled().catch(() => false))) {
+          advancedText = ((await loc.first().textContent().catch(() => '')) || '').trim();
+          await loc.first().click({ timeout: 5000 });
+          console.log(`    ✓ Step ${step}: clicked "${advancedText}"`);
+          advanced = true;
+          break;
+        }
+      } catch (e) {
+        // try next
+      }
+    }
+    if (!advanced) {
+      console.log(`    ⚠️  Step ${step}: no Next/Save button — stopping`);
+      break;
+    }
+    await page.waitForTimeout(2000);
+    await page.waitForLoadState('networkidle').catch(() => {});
+  }
+
+  await page.waitForTimeout(2000);
+  await shot(page, 'addstrategy_after_submit.png');
+
+  if (stratSaved) {
+    console.log(`  ✅ Strategy "${stratData.name}" submitted`);
+  } else {
+    console.log(`  ⚠️  Strategy form did not reach a Save action`);
+  }
+  return { status: stratSaved ? 'PASS' : 'PARTIAL', name: stratData.name };
+}
+
 async function addPlan() {
   const browser = await chromium.launch({ headless: false });
   const page = await browser.newPage();
@@ -622,7 +835,7 @@ async function addPlan() {
     }
     console.log(`Final URL: ${page.url()}`);
 
-    // After plan creation, navigate to the Employees tab and add 2 employees.
+    // After plan creation: add 2 employees, then a contribution strategy.
     if (saved && groupUrl) {
       try {
         await addEmployees(page, groupUrl, 2);
@@ -631,10 +844,18 @@ async function addPlan() {
         await shot(page, 'addemployee_error.png').catch(() => {});
         process.exitCode = 1;
       }
+
+      try {
+        await addStrategy(page, groupUrl);
+      } catch (e) {
+        console.error(`\n❌ Add Strategy failed: ${e.message}`);
+        await shot(page, 'addstrategy_error.png').catch(() => {});
+        process.exitCode = 1;
+      }
     } else if (!groupUrl) {
-      console.log(`\nℹ️  Skipping Add Employees — group URL was not captured`);
+      console.log(`\nℹ️  Skipping Add Employees / Strategy — group URL was not captured`);
     } else {
-      console.log(`\nℹ️  Skipping Add Employees because plan was not saved`);
+      console.log(`\nℹ️  Skipping Add Employees / Strategy because plan was not saved`);
     }
   } catch (error) {
     console.error(`\n❌ Failed: ${error.message}`);

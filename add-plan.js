@@ -249,9 +249,166 @@ async function tickAllRequiredCheckboxes(page) {
 }
 
 // ---- Main flow ----
+// Build employee data for the i-th employee in this run (1-based).
+// All fields are kept under 15 characters per the form's input limits.
+function buildEmployee(idx) {
+  // ts4 = last 4 digits of timestamp → ensures uniqueness across runs without exceeding limits
+  const ts4 = String(Date.now()).slice(-4);
+  const first = idx === 1 ? 'John' : 'Jane';
+  const last = idx === 1 ? 'Smith' : 'Doe';
+  return {
+    firstName: first,                  // 4
+    lastName: last,                    // 3-5
+    email: `${first.toLowerCase()}${idx}${ts4}@t.co`, // ≤15 (e.g. john17421@t.co = 14)
+    phone: '8435550101',               // 10
+    dateOfBirth: '1985-01-15',         // 10
+    hireDate: '2026-01-01',            // 10
+  };
+}
+
+async function addEmployees(page, groupUrl, count = 2) {
+  console.log(`\n--- Step 9: Add ${count} Employee(s) ---`);
+  const results = [];
+
+  for (let i = 1; i <= count; i++) {
+    const emp = buildEmployee(i);
+    console.log(`\n  ▶ Employee ${i}/${count}: ${emp.firstName} ${emp.lastName} (${emp.email})`);
+
+    // Navigate back to the group page each iteration so we land on a clean tab state.
+    await page.goto(groupUrl, { waitUntil: 'networkidle' }).catch(() => {});
+    await page.waitForTimeout(2500);
+    await page.waitForLoadState('networkidle').catch(() => {});
+
+    // Click the Employees tab. Tab text may include a count badge ("Employees 1").
+    const tabClicked = await clickFirstAvailable(page, [
+      page.locator('[data-testid="employees-tab"]'),
+      page.locator('button:visible').filter({ hasText: /^Employees(\s+\d+)?$/ }),
+      page.getByRole('button', { name: /^Employees(\s+\d+)?$/ }),
+      page.locator('[role="tab"]').filter({ hasText: /^Employees(\s+\d+)?$/ }),
+    ], `Clicked Employees tab (#${i})`);
+    if (!tabClicked) {
+      results.push({ idx: i, status: 'FAIL', reason: 'Employees tab not found' });
+      continue;
+    }
+    await page.waitForTimeout(2000);
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await shot(page, `addemployee_tab_${i}.png`);
+
+    // Click "+ Add Employee"
+    const addClicked = await clickFirstAvailable(page, [
+      page.locator('[data-testid="add-employee-btn"]'),
+      page.getByRole('button', { name: /^\+\s*Add Employee$/ }),
+      page.locator('button:visible').filter({ hasText: /^\+\s*Add Employee$/ }),
+      page.locator('button:visible').filter({ hasText: /Add Employee/ }),
+      page.getByRole('link', { name: /Add Employee/ }),
+    ], `Clicked "+ Add Employee" (#${i})`);
+    if (!addClicked) {
+      results.push({ idx: i, status: 'FAIL', reason: '"+ Add Employee" not found' });
+      continue;
+    }
+    await page.waitForTimeout(2500);
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await shot(page, `addemployee_form_opened_${i}.png`);
+
+    // Fill any visible inputs and selects — handle either single-form or multi-step wizards.
+    const MAX_FORM_STEPS = 4;
+    let empSaved = false;
+    for (let step = 1; step <= MAX_FORM_STEPS; step++) {
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(500);
+      const filled = await fillVisibleInputs(page, emp);
+      await selectVisibleDropdowns(page, emp);
+      await tickAllRequiredCheckboxes(page);
+      await page.waitForTimeout(500);
+      await shot(page, `addemployee_${i}_step${step}.png`);
+      console.log(`    ✓ Form step ${step}: filled ${filled} inputs`);
+
+      // Scroll to bottom so action buttons are in view
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(500);
+
+      // Terminal action first (Save / Submit / Add Employee / Create)
+      const terminalLocators = [
+        page.getByRole('button', { name: /^Save Employee$/ }),
+        page.getByRole('button', { name: /^Save$/ }),
+        page.getByRole('button', { name: /^Create Employee$/ }),
+        page.getByRole('button', { name: /^Create$/ }),
+        page.getByRole('button', { name: /^Submit$/ }),
+        page.getByRole('button', { name: /^Add Employee$/ }),
+        page.getByRole('button', { name: /^Finish$/ }),
+      ];
+      let terminalClicked = false;
+      for (const loc of terminalLocators) {
+        try {
+          if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false)) && (await loc.first().isEnabled().catch(() => false))) {
+            const text = (await loc.first().textContent().catch(() => '')) || '';
+            await loc.first().click({ timeout: 5000 });
+            console.log(`    ✓ Step ${step}: clicked terminal button "${text.trim()}"`);
+            terminalClicked = true;
+            break;
+          }
+        } catch (e) {
+          // try next
+        }
+      }
+      if (terminalClicked) {
+        empSaved = true;
+        await page.waitForTimeout(2500);
+        break;
+      }
+
+      // Otherwise advance with Next / Save & Next
+      const nextLocators = [
+        page.getByRole('button', { name: /^Save\s*&\s*Next/ }),
+        page.getByRole('button', { name: /^Next\b/ }),
+        page.getByRole('button', { name: /^Continue\b/ }),
+      ];
+      let advanced = false;
+      for (const loc of nextLocators) {
+        try {
+          if ((await loc.count()) > 0 && (await loc.first().isVisible().catch(() => false)) && (await loc.first().isEnabled().catch(() => false))) {
+            await loc.first().click({ timeout: 5000 });
+            console.log(`    ✓ Step ${step}: clicked Next`);
+            advanced = true;
+            break;
+          }
+        } catch (e) {
+          // try next
+        }
+      }
+      if (!advanced) {
+        console.log(`    ⚠️  Step ${step}: no Next/Save button — stopping`);
+        break;
+      }
+      await page.waitForTimeout(2000);
+      await page.waitForLoadState('networkidle').catch(() => {});
+    }
+
+    await page.waitForTimeout(2000);
+    await shot(page, `addemployee_${i}_after_submit.png`);
+
+    if (empSaved) {
+      console.log(`  ✅ Employee ${i} "${emp.firstName} ${emp.lastName}" submitted`);
+      results.push({ idx: i, status: 'PASS', firstName: emp.firstName, lastName: emp.lastName, email: emp.email });
+    } else {
+      console.log(`  ⚠️  Employee ${i} form did not reach a Save action`);
+      results.push({ idx: i, status: 'PARTIAL', firstName: emp.firstName, lastName: emp.lastName, email: emp.email });
+    }
+  }
+
+  // Summary
+  console.log(`\n--- Add Employees summary ---`);
+  for (const r of results) {
+    const icon = r.status === 'PASS' ? '✅' : r.status === 'PARTIAL' ? '⚠️ ' : '❌';
+    console.log(`${icon} #${r.idx}: ${r.firstName || ''} ${r.lastName || ''} ${r.email ? `<${r.email}>` : ''} ${r.reason ? `(${r.reason})` : ''}`);
+  }
+  return results;
+}
+
 async function addPlan() {
   const browser = await chromium.launch({ headless: false });
   const page = await browser.newPage();
+  let groupUrl = '';
 
   try {
     console.log(`🚀 Adding plan "${PLAN_NAME}" to group "${GROUP_NAME}"\n`);
@@ -310,8 +467,9 @@ async function addPlan() {
 
     await page.waitForTimeout(2500);
     await page.waitForLoadState('networkidle').catch(() => {});
+    groupUrl = page.url();
     await shot(page, 'addplan_group_details.png');
-    console.log(`✓ Group page loaded: ${page.url()}\n`);
+    console.log(`✓ Group page loaded: ${groupUrl}\n`);
 
     // Step 4: Plans tab is default after opening a group — but click it just in case
     console.log('--- Step 4: Ensure Plans tab is active ---');
@@ -463,6 +621,21 @@ async function addPlan() {
       process.exitCode = 1;
     }
     console.log(`Final URL: ${page.url()}`);
+
+    // After plan creation, navigate to the Employees tab and add 2 employees.
+    if (saved && groupUrl) {
+      try {
+        await addEmployees(page, groupUrl, 2);
+      } catch (e) {
+        console.error(`\n❌ Add Employees failed: ${e.message}`);
+        await shot(page, 'addemployee_error.png').catch(() => {});
+        process.exitCode = 1;
+      }
+    } else if (!groupUrl) {
+      console.log(`\nℹ️  Skipping Add Employees — group URL was not captured`);
+    } else {
+      console.log(`\nℹ️  Skipping Add Employees because plan was not saved`);
+    }
   } catch (error) {
     console.error(`\n❌ Failed: ${error.message}`);
     await shot(page, 'addplan_error.png').catch(() => {});
